@@ -1,0 +1,12 @@
+# Keep the line endings this project needs, whatever the platform.
+#
+# seer.bat MUST stay CRLF: cmd.exe needs CRLF, and a LF-only .bat is a classic
+# source of "the batch file just closes" / stray-token bugs.
+# Everything else is text and can be normalised to LF in the repository; Git
+# converts it back to CRLF on checkout under Windows (core.autocrlf).
+*.bat           text eol=crlf
+*.ps1           text eol=crlf
+*.py            text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+.gitignore      text eol=lf

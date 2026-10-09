@@ -1,0 +1,11 @@
+# --- 你的机器人 key：绝对不要提交 ---
+wecom_key.txt
+
+# --- 运行产物 ---
+seer_watch.log
+*.log
+
+# --- Windows / 编辑器噪声 ---
+Thumbs.db
+desktop.ini
+*.tmp
