@@ -362,7 +362,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\wenjianjia\bat\probe_all_
 
 ## 怎么认出日志框（关键：不能取"最长的"）
 
-**踩过的大坑**：一开始用"取文本最长的控件"当日志框。这个假设是**错的** ——
+**常见错误做法**：用"取文本最长的控件"当日志框。这个假设是**错的** ——
 XM 里还有别的长文本控件（比日志框更长），于是每次都拿到错的控件，
 表现就是"XM 明明在正常运行，却报读不到日志"。
 
@@ -516,11 +516,11 @@ send: OK  HTTP 200 {"errcode":0,"errmsg":"ok"}
 1. **读日志**：XM 的清单是 `requireAdministrator`，读内存会返回错误 5，所以走
    **UI Automation** 读控件文本（跨进程、无需管理员）。
    日志框在 UIA 里是 `ControlType.Pane` 而 `ClassName=Edit`，
-   **按 `ControlType.Edit` 过滤会得到 0 个结果**（踩过这个坑）。
+   **按 `ControlType.Edit` 过滤会得到 0 个结果**。
 
 2. **怎么判断"新事件"**：点击前把已有匹配行**文本**拍成快照，之后出现快照里没有的行才算新事件。
 
-   ⚠️ 两个错误做法都踩过：
+   ⚠️ 两个错误做法：
    - 按"匹配条数增加"判断 → 日志框是 29 行滚动窗口，增一行会挤掉一行，条数不变就永远不触发。
    - 点击后先 sleep 再检测 → 实测魔法**几秒就跑完**（21:09:29 点击，21:09:55 已全部结束），
      等 30 秒再建基线会把开始/完成两个标记都当成旧事件漏掉。
@@ -545,22 +545,17 @@ send: OK  HTTP 200 {"errcode":0,"errmsg":"ok"}
    - `seer.bat`：**纯 ASCII，一句中文都不要写**。
      ⚠️ 原因：cmd.exe 解析 `.bat` 用的是 ANSI 代码页，`chcp 65001` 对"已经开始的解析"不生效，
      无 BOM 的 UTF-8 中文会被拆成一堆垃圾 token，然后 cmd 逐条报
-     `'...' is not recognized as an internal or external command`（实测踩过这个坑）。
+     `'...' is not recognized as an internal or external command`。
      所以中文输出（流程提示、退出码说明）全部由 PowerShell 打印。
    - 所有 `.ps1`：**纯 ASCII**（中文一律用 Unicode 码点 `U @(0x...)` 构造）。
      PowerShell 5.1 会按 ANSI 解码**无 BOM 的 UTF-8 源码**，
-     源码里只要出现中文注释就会把脚本读坏（踩过两次）。
+     源码里只要出现中文注释就会把脚本读坏，所以中文一律用码点构造。
 
-7. **推送用纯 PowerShell，不需要 Python**：开始/完成/失败/超时通知都是一个 HTTPS POST，
-   用 `Invoke-RestMethod` 发送（失败时回退 `HttpClient`）。
+7. **推送只需要 PowerShell，不需要 Python**：开始/完成/失败/超时通知都是一个
+   HTTPS POST，用 `Invoke-RestMethod` 发送，失败时回退到 `HttpClient`。
+   两者都在 .NET 里，无需安装任何第三方组件。
 
-   ⚠️ **重要更正**：早期版本改用 Python 发送，理由是"本机 PowerShell/curl/.NET 的 HTTPS
-   全部报 `Schannel: No credentials are available in the security package`"。
-   **这个判断是错的** —— 那是 AI 开发沙箱的限制，不是本机的问题。实测本机
-   `Invoke-RestMethod`、`HttpClient`、Python 三者都能正常返回 `{"errcode":0,"errmsg":"ok"}`，
-   所以 Python 依赖已被移除，`send_wecom.py` 已删除。
-
-   仍然保留的编码要点：**消息文本走请求体的 UTF-8 字节，绝不走命令行参数**
+   编码要点：**消息文本走请求体的 UTF-8 字节，绝不走命令行参数**
    （PowerShell 5.1 用 ANSI 代码页编码原生 argv，中文会变乱码）。
 
 ## 常见问题

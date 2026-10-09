@@ -1,9 +1,7 @@
-# --- 你的机器人 key：绝对不要提交 ---
-wecom_key.txt
-
-# --- 运行产物 ---
+# --- 运行产物（不要把日志和压缩包提交进去） ---
 seer_watch.log
 *.log
+*.zip
 
 # --- Windows / 编辑器噪声 ---
 Thumbs.db

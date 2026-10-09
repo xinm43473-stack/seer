@@ -21,16 +21,10 @@
 #  WHY POWERSHELL ONLY (no Python)
 #    * reading XM's log needs UI Automation (PowerShell can do it unelevated)
 #    * sending the WeCom webhook is a plain HTTPS POST, done here with
-#      Invoke-RestMethod and an HttpClient fallback.
-#    Earlier versions shelled out to send_wecom.py because HTTPS appeared broken
-#    (Schannel "No credentials are available in the security package"). That was
-#    a sandbox artefact, not this machine: Invoke-RestMethod works fine here, so
-#    the Python dependency has been dropped.
-#    Message text still travels in the request BODY as UTF-8 bytes, never
-#    through argv, so the Chinese content is never mangled.
-#
-#  This file is PURE ASCII on purpose (PowerShell 5.1 mis-decodes UTF-8 sources
-#  without a BOM). Chinese strings are built from Unicode code points.
+#      Invoke-RestMethod and an HttpClient fallback - both are .NET, so nothing
+#      has to be installed.
+#    Message text travels in the request BODY as UTF-8 bytes, never through
+#    argv, so the Chinese content is never mangled.
 # =============================================================================
 
 # =============================================================================
