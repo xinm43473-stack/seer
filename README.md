@@ -188,7 +188,7 @@ webhook : https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...48da10af   (fr
 
 ```text
 # 写 exe 的完整路径，或者只写它所在的文件夹，都行
-D:\wenjianjia\xm\XM.exe
+例如:D:\wenjianjia\xm\XM.exe
 ```
 
 两种写法都认（实测通过），从资源管理器复制带引号也会自动去掉：
