@@ -1,6 +1,6 @@
 # XM 赛尔号脱机日常 —— 启动 + 完成检测 + 企业微信推送
 
-> **首次使用**：企业微信 key 是**可选的**；不填也能跑，只是不会推送。XM 路径默认已配置好。
+> **首次使用**：企业微信 key 是**可选的**但是主要功能；不填也能跑，只是不会推送。
 >
 > 1. **企业微信机器人 key** —— 编辑 `wecom_key.txt`，把 `YOUR-KEY-HERE` 换成你的 key：
 >    ```text
@@ -16,7 +16,7 @@
 > （这两个文件也写进了 `.gitignore`，避免你误提交自己的）。
 >
 > 环境要求：**只要 Windows 自带的 PowerShell 5.1**，不需要 Python、不需要 pip。
-
+>3.将**XM.exe **中的任务[日常签到&道具兑换]勾选用于检测开始
 ## 这是什么
 
 右键以管理员模式运行 `seer.bat` 后/将 `seer.bat` 加入win任务计划程序选择使用最高权限运行全自动执行：
@@ -29,7 +29,7 @@
 [时:分:秒]:开始执行[日常签到&道具兑换]   → 推送 [时:分:秒]:开始执行（去掉列表名）
 [时:分:秒]:选择任务已执行完毕~           → 推送该行原文
 ```
-
+![推送图片表示](图/595499aa253b7d5bddf8351613c9f357.jpg)
 没等到开始标记 → 推送 `任务失败`；一直没等到完成标记 → 推送 `任务执行超时，未检测到完成提示`。
 
 推送内容示例：
@@ -92,7 +92,6 @@ Start-Sleep -Milliseconds 150
 
 ## 等待方式：等 UI 就绪 + 3 秒缓冲（提速的关键）
 
-初版是"点完等 60 秒"，纯浪费时间。现在**等控件就绪**再点：
 
 | 步骤 | 等待条件 | 上限参数 |
 |---|---|---|
@@ -101,8 +100,6 @@ Start-Sleep -Milliseconds 150
 | 点击后 | 轮询直到"开始"控件出现**且 `IsEnabled`** | `-StartTimeoutSeconds`（默认 300s） |
 | 每个控件就绪后 | 再等 `-SettleSeconds`（默认 **3 秒**）让界面画完，然后点击 | `-SettleSeconds` |
 
-所以正常情况下**几秒内就能点完三下**，比原来的 150 秒快得多。
-"开始"按钮的 `IsEnabled` 就是"登陆成功、任务列表已加载"的信号，比死等 60 秒准得多。
 
 > 找不到控件时会对窗口做一次 `SW_RESTORE` + 置前，再查一遍（窗口被压住或最小化时控件会从自动化树里消失）。
 
@@ -176,7 +173,7 @@ seer.bat -Webhook "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=新的ke
 **日志不会打印完整 key**，只显示尾 8 位和来源，方便你贴日志求助：
 
 ```
-webhook : https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...48da10af   (from wecom_key.txt)
+webhook : https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...1a2b3c4d   (from wecom_key.txt)
 ```
 
 怎么拿到 key：企业微信群 → 右上角 → 群机器人 → 添加机器人 → 新建 →
@@ -188,16 +185,30 @@ webhook : https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...48da10af   (fr
 
 ```text
 # 写 exe 的完整路径，或者只写它所在的文件夹，都行
-例如:D:\wenjianjia\xm\XM.exe
+例如:D:\path\to\xm\XM.exe
 ```
 
 两种写法都认（实测通过），从资源管理器复制带引号也会自动去掉：
 
 ```text
-D:\wenjianjia\xm\XM.exe            ← 完整路径
-D:\wenjianjia\xm                   ← 只写文件夹
-"D:\wenjianjia\xm\XM.exe"          ← 带引号（资源管理器"复制文件地址"的格式）
+D:\path\to\xm\XM.exe            ← 完整路径（就用名为XM.exe的程序）
+D:\path\to\xm                   ← 只写文件夹（自动挑里面最新的那个）
+"D:\path\to\xm\XM.exe"          ← 带引号（资源管理器"复制文件地址"的格式）
 ```
+
+**只写文件夹时怎么挑**：XM 的版本文件是按
+`XM Seer脱机日常 ver x.x.xx.exe` 命名的，一个目录里常常并排放着好几个。
+
+1. 在这些按官方命名的版本里，**挑"最后修改时间"最新的那个** ——
+   也就是你最近下载、最近放进来的那一个
+2. 一个官方命名的都没有，才用普通的 `XM.exe`
+3. 再没有才按文件名取第一个
+
+**为什么按时间而不是按版本号**：作者的文件名编号并不是递增的，
+实测 `ver 2.6.3` 的发布时间比 `ver 2.6.22` 还晚，只按数字比大小会挑到旧版本。
+
+**自己改过名的副本不参与挑选** ——
+只要目录里有按官方命名的版本，就轮不到它们。
 
 优先级（高 → 低）：
 
@@ -212,15 +223,14 @@ seer.bat -XmExeOverride "E:\games\XM\XM.exe"
 ```
 
 **不需要管"工作目录"**：XM 的 `ini\` 配置和缓存是放在
-`XM.exe` 自己所在的文件夹里的（现在 bat 在 `D:\wenjianjia\bat`，
-XM 在 `D:\wenjianjia\xm`，照样能读到 `ini\`）。
+`XM.exe` 自己所在的文件夹里的（脚本和 XM 放在不同目录也照样能读到 `ini\`）。
 所以把 `xm_path.txt` 指向新目录就够了。
 
 路径不存在时会明确报错并停在退出码 9，不会静默跑错程序：
 
 ```
 xm path : E:\nope\XM.exe   (from -XmExeOverride argument)
-XM.exe not found: E:\nope\XM.exe
+XM executable not found: E:\nope\XM.exe
 ```
 
 ## 有新版本时的处理
@@ -274,7 +284,6 @@ new-version notification sent.
 | `-Webhook` | 空 | 临时覆盖推送地址（优先于 `wecom_key.txt`） |
 | `-XmExeOverride` | 空 | 临时覆盖 XM.exe 路径（优先于 `xm_path.txt`） |
 | `-UseFixedCoords` | 关 | 改用固定像素点击（完全等同原版行为） |
-| `-ReturnToDesktop` | 关 | **检测到"开始执行"后**最小化 XM 并回到桌面（检测不受影响） |
 | `-EnterX/-EnterY` 等 | 760/460、180/180、890/590 | **仅** `-UseFixedCoords` 时生效 |
 | `-NoSend` | 关 | 只检测不推送（调试） |
 | `-AllowExisting` | 关 | 接受日志里已存在的标记（**仅自检**） |
@@ -283,9 +292,8 @@ new-version notification sent.
 例：
 
 ```bat
-seer.bat -ReturnToDesktop
-seer.bat -SettleSeconds 5 -ReturnToDesktop
 seer.bat -UseFixedCoords
+seer.bat -SettleSeconds 5
 ```
 
 ## ⚠️ 关于"日志 txt"的一个重要区别
@@ -304,41 +312,11 @@ seer.bat -UseFixedCoords
 因此生产代码里**每个元素的属性读取都单独 `try/catch`**：
 一个元素读失败不能中断对其余元素的搜索。
 
-## 实测结论：登录前根本没有日志框
-
-我用 UIA 亲自对真实的 XM 做了取证（启动 XM 后探测），结果：
-
-```
-XM processes: 2
-top-level windows: 16
-all windows (top + children): 46
-hwnd=0xA0600 class=WTWindow visible=True EditControls=1 IS-LOGBOX=False title="XM Seer脱机日常"
-      chars=96 lines=5
-      first=[[v2.5.7]：]
-      last =[(脱机之前的版本更新内容可看更新日志)]
-total Edit-class controls seen: 4
-windows containing a log-like box: 0
-```
-
-**46 个窗口（顶层 + 子窗口）里只有一个 96 字的"版本更新公告"，没有任何日志框。**
-
-结论：XM 的日志框是**登录/游戏连接之后才出现/才开始有内容**的。
-所以运行日志里那句报警
-
-```
-Edit-controls in main window=-1
-```
-
-的真实含义是**"那一刻没有日志框"**，不是代码读失败。它出现在"点击登录后 / 点击开始后"
-那两个时间点，恰恰就是日志框还没被创建出来的时候。
-
-⚠️ 我用账号登录不了，所以**无法自己复现"已登录 + 正在跑日常"的状态**。
-要定位日志框在那种状态下属于哪个窗口/哪个进程，必须在**正在跑**的时候取一次证 —— 见下。
 
 ## 取证工具（跑日常时用）
 
 ```bat
-powershell -NoProfile -ExecutionPolicy Bypass -File D:\wenjianjia\bat\probe_all_windows.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\path\to\bat\probe_all_windows.ps1
 ```
 
 它枚举 XM 进程的**顶层窗口 + 所有子窗口**（不只顶层），对每个窗口报告
@@ -359,36 +337,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\wenjianjia\bat\probe_all_
 第 3 步是为"日志框其实归另一个进程所有"这种情况准备的。
 内容规则很严（必须含 `选择任务已执行完毕~` 或 `开始执行[...]` 这类中文任务标记），
 所以误命中别的程序的概率极低。
-
-## 怎么认出日志框（关键：不能取"最长的"）
-
-**常见错误做法**：用"取文本最长的控件"当日志框。这个假设是**错的** ——
-XM 里还有别的长文本控件（比日志框更长），于是每次都拿到错的控件，
-表现就是"XM 明明在正常运行，却报读不到日志"。
-
-**正确做法：按内容认**，而不是按长度、也不依赖固定的行号
-（行号会随日志滚动、清空、中途运行而变化）：
-
-1. 文本必须是多行的，且**第 1 行**以 `[时:分:秒]` 开头；
-2. 然后只要满足下列之一，就认定它是 XM 任务日志框：
-   - 任意一行是 **`选择任务已执行完毕~`**（任务全部跑完）；
-   - 任意一行是 **`开始执行[自定义魔法-Flash]`**（自定义魔法开始，覆盖"还在跑"的情况）；
-   - 任意一行含 **`[自定义魔法`**（更宽松的兜底）。
-
-实测日志（23:56 那次，29 行）就是标准形状：
-
-```
-[23:56:24]:游戏数据加载中ing...
-[23:56:25]:游戏数据加载完毕！
-[23:56:33]:[Flash]服务器连接成功
-[23:56:36]:[Flash]服务器登录成功
-[23:56:42]:开始执行[自定义魔法-Flash]      ← 第 5 行
-...
-[23:57:05]:选择任务已执行完毕~              ← 最后一行
-```
-
-**为什么不做成"严格第 5 行 + 末行"**：日志是滚动窗口，行数和位置会变。
-按内容认更稳，而且**同样能挡住长诱饵**——诱饵里不会含这些标记。
 
 ### 单元测试（`test_logbox.ps1`，不需要 XM）
 
@@ -430,7 +378,7 @@ log not readable yet: XM processes=1, top-level windows=24, MainWindowHandle=0x1
 ### 排查工具（不点击）
 
 ```bat
-powershell -NoProfile -ExecutionPolicy Bypass -File D:\wenjianjia\bat\probe_xm_windows.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\path\to\bat\probe_xm_windows.ps1
 ```
 
 它遍历 XM 所有顶层窗口的**全部后代节点**（带逐元素容错），列出每个长文本/文本类控件，
@@ -446,22 +394,6 @@ hwnd=0x908AA visible=True minimized=False Edit-controls=11
 ```
 
 `IS-LOGBOX=True` 的那条就是日志框；如果全是 `False`，把这个输出发我。
-
-## 回到桌面
-
-**检测到 `开始执行[日常签到&道具兑换]` 之后**，加 `-ReturnToDesktop` 会把 XM 最小化并显示桌面：
-
-```bat
-seer.bat -ReturnToDesktop
-```
-
-要点：
-
-- **时机**：在检测到「开始执行」之后才执行。这时三次点击早已完成、任务已在跑，
-  所以**不会干扰点击流程**（点击三连需要 XM 在前台）。
-  同时这个时点也正是日志框刚刚可读的时候，说明 XM 已经完全起来了。
-- **不影响检测**：日志是通过 UI Automation 读的，窗口最小化后仍然可读，
-  加上上面的多窗口扫描，检测照常工作。
 
 ## 退出码
 
@@ -483,16 +415,16 @@ seer.bat -ReturnToDesktop
 **先确认按钮能被定位**（不点击）：
 
 ```bat
-powershell -NoProfile -ExecutionPolicy Bypass -File D:\wenjianjia\bat\find_button.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\path\to\bat\find_button.ps1
 ```
 
 **验证"定位+点击"链路本身没问题**（自建窗口，不碰 XM，实测 PASS）：
 
 ```bat
-powershell -NoProfile -ExecutionPolicy Bypass -File D:\wenjianjia\bat\selftest_ui.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\path\to\bat\selftest_ui.ps1
 ```
 
-**看日志**：`D:\wenjianjia\bat\seer_watch.log` 每次运行都会写：
+**看日志**：`D:\path\to\bat\seer_watch.log` 每次运行都会写：
 
 ```
 mode: click buttons located through UI Automation (name-based)
@@ -581,4 +513,3 @@ A：**照常运行**。脚本会完整执行：启动 XM.exe → 依次点击进
 也就是说**克隆下来就能直接用**，等你想接企业微信时再往 `wecom_key.txt` 填 key。
 
 > 退出码含义：`9` = 找不到 `XM.exe`；当前已没有"缺 key 退出"这个码了。
-

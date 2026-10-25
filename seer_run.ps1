@@ -4,19 +4,35 @@
 #  Replaces the fragile batch control flow with something testable.
 #  Called by seer.bat (which stays as a double-clickable launcher).
 #
-#  FLOW  (three clicks, each performed ONCE - same timing as the original
-#         working seer.bat; there is deliberately NO retry loop)
-#    1) start XM.exe, wait 30s, click (760,460) "enter offline mode"
-#       wait 60s, click (180,180) "login", wait 60s
-#    2) snapshot the log, click (890,590) "start", then poll immediately
-#    3) start line appears      -> push that exact log line
-#       or nothing within 60s   -> push the failure message
-#    4) completion line appears -> push that exact log line
+#  FLOW  (every click is CONFIRMED before the next one is attempted)
+#    1) start XM.exe, click "enter offline mode" (or, if that is missing, the
+#       "keep using this version" prompt) and confirm the button went away
+#    2) click "login" on the next screen and confirm it went away
+#       (XM enables "start" only after login succeeds)
+#    3) snapshot the log, click "start", confirm it turned into "stop"
+#    4) start line appears      -> push that exact log line
+#       or nothing within 300s  -> push the failure message
+#    5) completion line appears -> push that exact log line
 #       or nothing within 4h    -> push the timeout message
 #
-#  WHY NO RETRY: if the first "start" click does not take effect, clicking the
-#  same pixel again lands on exactly the same dead spot (observed in the 21:16
-#  run: 1/3, 2/3, 3/3 all clicked (890,590) and the log never moved).
+#  CONFIRMATION AND RETRY: a button that was really pressed removes itself from
+#  the screen - "login" replaces "enter offline mode", "stop" replaces "start".
+#  So -ButtonCheckSeconds after each click the same control is looked up again:
+#    gone                                  -> the click landed, move on
+#    still there                           -> the click missed, press it again
+#    gone while the next screen is not up  -> transition, keep waiting (pressing
+#                                             a button that is no longer there
+#                                             could only fail)
+#  This is what the old "no retry" comment was about: re-clicking the same PIXEL
+#  when the click had missed landed on the same dead spot, because it never
+#  checked whether anything had actually happened. Looking the control up again
+#  is the difference.
+#
+#  WHY THIS NEEDS ADMINISTRATOR RIGHTS
+#    XM.exe is manifested "requireAdministrator", so XM always runs elevated.
+#    An unelevated process can still SEE its controls through UI Automation, but
+#    Windows (UIPI) drops every mouse event it injects into an elevated window,
+#    so each click silently does nothing. seer.bat asks for elevation itself.
 #
 #  WHY POWERSHELL ONLY (no Python)
 #    * reading XM's log needs UI Automation (PowerShell can do it unelevated)
@@ -37,8 +53,6 @@
 #    * start notification is trimmed to [hh:mm:ss]:start executing
 #    * completion is checked every 5 minutes (-DonePollSeconds) by reading only
 #      the NEWEST log line, instead of snapshotting the whole log every second
-#    * -ReturnToDesktop minimises XM and shows the desktop once the start line is
-#      detected (still reads the log through UIA while minimised)
 #    * WeCom webhook sent with the .NET HTTP stack - no Python needed
 #    * the robot key lives in wecom_key.txt and the XM path in xm_path.txt, so
 #      neither has to be edited inside the script
@@ -55,6 +69,15 @@ param(
     [int]$LoginTimeoutSeconds   = 180,      # wait for the "login" button
     [int]$StartTimeoutSeconds   = 300,      # wait for "start" to be ENABLED
     [int]$SettleSeconds         = 3,        # pause once ready, before clicking
+    # Click confirmation. A pressed button removes itself from the screen, so
+    # after every click the same control is looked up again:
+    #   still there after $ButtonCheckSeconds -> the click missed -> press again
+    #   gone                                  -> the click landed
+    # At most $ButtonRetryCount presses per button. A re-press only waits
+    # $ButtonRetrySeconds, because the control was just seen on screen.
+    [int]$ButtonCheckSeconds    = 5,
+    [int]$ButtonRetryCount      = 3,
+    [int]$ButtonRetrySeconds    = 20,
     # Wait for the start line. Measured: after clicking "start", XM needs roughly
     # 40-60s before the log box appears and fills in, so 60s was too tight and the
     # detection window closed right before the log became readable.
@@ -70,7 +93,6 @@ param(
     [int]$StartX = 890, [int]$StartY = 590,
 
     [switch]$UseFixedCoords,         # click fixed pixels instead of locating the button
-    [switch]$ReturnToDesktop,        # on detecting the start line, minimise XM and show the desktop
     # Webhook override. Leave empty to use wecom_key.txt (next to this script),
     # falling back to the built-in key baked into $DefaultWebhook below.
     [string]$Webhook = '',
@@ -176,19 +198,57 @@ $LogFile = Join-Path $Bin 'seer_watch.log'
 #   3. $DefaultXmExe below                   (built-in fallback)
 # XM keeps its data (ini\ config, caches) NEXT TO ITS OWN EXE, so pointing this
 # at another folder is enough - the working directory does not matter.
-$DefaultXmExe = 'D:\wenjianjia\xm\XM.exe'
+$DefaultXmExe = 'D:\path\to\xm\XM.exe'
 $XmPathFile   = Join-Path $Bin 'xm_path.txt'
 $XmExe        = $DefaultXmExe
 $XmSource     = 'built-in default'
 
+function Select-XmExeInFolder {
+    # Choose the executable to launch out of a folder that may hold several
+    # builds at once. Official builds are named "XM Seer<product words> ver
+    # x.x.xx.exe" and old ones are kept side by side.
+    #
+    # The rule is simply: THE FILE THAT WAS WRITTEN TO DISK LAST WINS. Do not
+    # compare the numbers in the name - the author's numbering is NOT monotonic
+    # (a real batch had "ver 2.6.3" published AFTER "ver 2.6.22"), so the newest
+    # release can carry a numerically smaller number.
+    #
+    # A plain "XM.exe" is NOT an official name - it is a personal copy kept so a
+    # desktop shortcut keeps working - so it is only used when no versioned
+    # official build is present, otherwise an outdated copy would win. Random
+    # test names such as "XM 3564.exe" are never picked while an official build
+    # exists.
+    param([string]$Dir)
+    if (-not $Dir) { return '' }
+    $exes = @()
+    try { $exes = @(Get-ChildItem -LiteralPath $Dir -Filter '*.exe' -File -ErrorAction Stop) } catch { return '' }
+    if ($exes.Count -eq 0) { return '' }
+
+    # "XM <product words> ver 2.6.31.exe". The version part is ASCII, so the
+    # pattern never has to spell out the chinese product name.
+    $cands = @($exes | Where-Object { $_.Name -match '^XM .*ver[ _-]*\d+(?:\.\d+){1,3}\.exe$' })
+    if ($cands.Count -gt 0) {
+        $newest = @($cands | Sort-Object -Property @{ Expression = { $_.LastWriteTime }; Descending = $true })
+        return $newest[0].FullName
+    }
+
+    # No versioned official build: fall back to a plain XM.exe, then to any exe.
+    $def = Join-Path $Dir 'XM.exe'
+    if (Test-Path -LiteralPath $def) { return $def }
+    return ($exes | Sort-Object Name | Select-Object -First 1).FullName
+}
+
 function Resolve-XmPath {
     # Tidy up a user-supplied path: strip quotes/spaces, then accept either a
-    # full path to XM.exe or just the folder that contains it.
+    # full path to the executable or just the folder that contains it.
     param([string]$Value)
     if (-not $Value) { return '' }
     $v = $Value.Trim().Trim('"').Trim("'")
     if ($v.Length -eq 0) { return '' }
     if ($v -match '\.exe$') { return $v }
+    # A folder: pick the newest build inside it (see Select-XmExeInFolder).
+    $picked = Select-XmExeInFolder -Dir $v
+    if ($picked) { return $picked }
     return (Join-Path $v 'XM.exe')
 }
 
@@ -206,6 +266,23 @@ if ($XmExeOverride) {
     } else {
         $XmSource = 'built-in default (xm_path.txt was empty)'
     }
+}
+
+# The process name is whatever the exe FILE is called, without the extension.
+# XM is not always named XM.exe: a renamed copy such as "XM 3564.exe" runs as the
+# process "XM 3564". Every lookup below has to use that name, otherwise the script
+# launches the game and then waits forever for a process it keeps calling "XM".
+$XmProcName = ''
+try { $XmProcName = [System.IO.Path]::GetFileNameWithoutExtension($XmExe) } catch {}
+if (-not $XmProcName) { $XmProcName = 'XM' }
+
+function Get-XMProcess {
+    # Find the game's processes. Get-Process -Name does WILDCARD matching, so a
+    # renamed exe such as "XM[1].exe" would either throw or match something else;
+    # comparing the plain name avoids that. Get-Process enumerates the same list
+    # either way, so this costs nothing extra.
+    return @(Get-Process -ErrorAction SilentlyContinue |
+             Where-Object { $_.ProcessName -eq $script:XmProcName })
 }
 
 # ---- WeCom webhook (soft-coded) ---------------------------------------------
@@ -392,8 +469,12 @@ function Invoke-ButtonClick {
         Write-Log ('  click_ui.ps1 missing at ' + $ui) 'ERROR'
         return $false
     }
-    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $ui -Key $Key -Wait `
-                        -TimeoutSeconds $TimeoutSeconds -SettleSeconds $SettleSeconds 2>&1
+    # Only pass -ProcessName when it is known. An empty value would reach the
+    # child as a bare "-ProcessName" and make it fail to bind the parameter.
+    $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ui, '-Key', $Key, '-Wait',
+                '-TimeoutSeconds', $TimeoutSeconds, '-SettleSeconds', $SettleSeconds)
+    if ($script:XmProcName) { $psArgs += @('-ProcessName', $script:XmProcName) }
+    $out = & powershell @psArgs 2>&1
     $rc = $LASTEXITCODE
     $txt = (($out | Out-String).Trim())
     if ($txt) { Write-Log ('  ui-click: ' + $txt) }
@@ -408,6 +489,104 @@ function Invoke-ButtonClick {
     $script:LastClickedKey = $Key
     if ($txt -match 'found key=(\S+)') { $script:LastClickedKey = $Matches[1] }
     return $true
+}
+
+function Test-ButtonPresent {
+    # Is the control for $Key still on screen?
+    #
+    # click_ui.ps1 -Probe is a locate-only run: it never settles and never
+    # clicks, so this is a cheap "is it still there?" question. click_ui.ps1 also
+    # raises a hidden/covered XM window once when nothing matches, which is what
+    # keeps a covered window from looking like a control that went away.
+    param([string]$Key)
+    if ($Key -notin @('enter', 'login', 'start')) { return $false }
+
+    $ui = Join-Path $Bin 'click_ui.ps1'
+    if (-not (Test-Path -LiteralPath $ui)) { return $false }
+
+    # Only pass -ProcessName when it is known. An empty value would reach the
+    # child as a bare "-ProcessName" and make it fail to bind the parameter.
+    $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ui, '-Key', $Key, '-Probe')
+    if ($script:XmProcName) { $psArgs += @('-ProcessName', $script:XmProcName) }
+    $out = & powershell @psArgs 2>&1
+    $rc = $LASTEXITCODE
+    $txt = (($out | Out-String).Trim())
+    if ($txt) { Write-Log ('  probe: ' + $txt) }
+    return ($rc -eq 0)
+}
+
+function Invoke-StepWithCheck {
+    # Press one button and make sure the press actually took effect.
+    #
+    # The confirmation is the button's own disappearance (see the FLOW comment
+    # at the top). $PrevKey gates the step: the button of the PREVIOUS step must
+    # already be gone before this one is pressed, otherwise it is pressed again
+    # first - that is the "check the previous button before pressing the next"
+    # rule, and it is what stops a step-2 wait from burning its whole timeout
+    # while step 1 never landed.
+    param(
+        [ValidateSet('enter', 'login', 'start')][string]$Key,
+        [string]$PrevKey = '',
+        [int]$TimeoutSeconds = 180,
+        [int]$FallbackX = 0,
+        [int]$FallbackY = 0
+    )
+
+    # Without a usable UIA helper (or with -UseFixedCoords) there is nothing to
+    # look up, so fall back to a single plain click.
+    $ui = Join-Path $Bin 'click_ui.ps1'
+    if ($UseFixedCoords -or -not (Test-Path -LiteralPath $ui)) {
+        return (Invoke-ButtonClick -Key $Key -TimeoutSeconds $TimeoutSeconds `
+                                   -FallbackX $FallbackX -FallbackY $FallbackY)
+    }
+
+    # ---- gate: is the previous step really done? -----------------------------
+    #
+    # Done means either the previous button is gone, or the next button is
+    # already on screen. The second test comes first on purpose: if the next
+    # button is already there, pressing the previous one again is pointless.
+    if ($PrevKey) {
+        for ($g = 1; $g -le $ButtonRetryCount; $g++) {
+            if (Test-ButtonPresent -Key $Key) {
+                Write-Log ('  "' + $Key + '" is already on screen -> going straight for it')
+                break
+            }
+            if (-not (Test-ButtonPresent -Key $PrevKey)) { break }
+            Write-Log ('  "' + $PrevKey + '" is still on screen before "' + $Key +
+                       '" -> pressing "' + $PrevKey + '" again (' + $g + '/' +
+                       $ButtonRetryCount + ')') 'WARN'
+            [void](Invoke-ButtonClick -Key $PrevKey -TimeoutSeconds $ButtonRetrySeconds)
+            Start-Sleep -Seconds $ButtonCheckSeconds
+        }
+    }
+
+    # ---- press, then confirm ---------------------------------------------------
+    for ($i = 1; $i -le $ButtonRetryCount; $i++) {
+        $wait = $TimeoutSeconds
+        if ($i -gt 1) { $wait = $ButtonRetrySeconds }
+
+        if (-not (Invoke-ButtonClick -Key $Key -TimeoutSeconds $wait `
+                                     -FallbackX $FallbackX -FallbackY $FallbackY)) {
+            # Never found. If it is gone as well, it simply vanished while we
+            # were looking - i.e. the earlier press did land after all.
+            if (-not (Test-ButtonPresent -Key $Key)) {
+                Write-Log ('  "' + $Key + '" disappeared before it could be pressed again -> treated as done')
+                return $true
+            }
+            return $false
+        }
+
+        Start-Sleep -Seconds $ButtonCheckSeconds
+        if (-not (Test-ButtonPresent -Key $Key)) {
+            Write-Log ('  confirmed: "' + $Key + '" is gone ' + $ButtonCheckSeconds +
+                       's after the click')
+            return $true
+        }
+        Write-Log ('  "' + $Key + '" is still on screen ' + $ButtonCheckSeconds +
+                   's after the click -> pressing it again (' + $i + '/' +
+                   $ButtonRetryCount + ')') 'WARN'
+    }
+    return $false
 }
 
 function Get-NewVersionNotifyText {
@@ -442,6 +621,39 @@ public delegate bool EnumProc(IntPtr h, IntPtr l);
 static extern bool EnumWindows(EnumProc cb, IntPtr l);
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+static extern bool IsWindowVisible(IntPtr h);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+static extern bool IsIconic(IntPtr h);
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = CharSet.Unicode)]
+static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder sb, int n);
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = CharSet.Unicode)]
+static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder sb, int n);
+
+// Which window is the game itself? Process.MainWindowHandle cannot be used:
+// input-method DLLs (iFlytek) create their own top-level windows inside the XM
+// process, and Windows then reports one of those as the main window - observed
+// class "iFLY_notify_window", a 628x100 strip. Restoring or pinning that window
+// painted a black band above the taskbar. The game window is the visible
+// top-level "WTWindow" with the longest title, preferring a non-minimised one.
+public static IntPtr PickGameWindow(int[] pids) {
+    IntPtr best = IntPtr.Zero;
+    long bestScore = -1;
+    IntPtr[] tops = WindowsOfPids(pids);
+    for (int i = 0; i < tops.Length; i++) {
+        IntPtr h = tops[i];
+        if (!IsWindowVisible(h)) { continue; }
+        System.Text.StringBuilder cn = new System.Text.StringBuilder(256);
+        GetClassNameW(h, cn, 256);
+        if (cn.ToString() != "WTWindow") { continue; }
+        System.Text.StringBuilder tb = new System.Text.StringBuilder(512);
+        GetWindowTextW(h, tb, 512);
+        long score = (long)tb.Length * 1000;
+        if (!IsIconic(h)) { score += 500; }
+        if (score > bestScore) { bestScore = score; best = h; }
+    }
+    return best;
+}
 
 public static IntPtr[] WindowsOfPids(int[] pids) {
     System.Collections.Generic.List<IntPtr> found = new System.Collections.Generic.List<IntPtr>();
@@ -481,7 +693,7 @@ function Get-XMWindows {
     # Every window owned by an XM.exe process: top-level windows AND their child
     # windows (recursively). The log box can live in a child window, which a
     # top-level-only scan would never see.
-    $procs = @(Get-Process -Name 'XM' -ErrorAction SilentlyContinue)
+    $procs = @(Get-XMProcess)
     if ($procs.Count -eq 0) { return @() }
     $pids = @($procs | ForEach-Object { [int]$_.Id })
     try {
@@ -493,6 +705,16 @@ function Get-XMWindows {
         foreach ($h in $kids) { if (-not $all.Contains($h)) { [void]$all.Add($h) } }
         return @($all.ToArray())
     } catch { return @() }
+}
+
+function Get-XMMainWindow {
+    # The game window itself - NOT Process.MainWindowHandle. See the comment on
+    # Win.XW.PickGameWindow for why that property points at an input-method
+    # window and why touching it draws a black band above the taskbar.
+    $procs = @(Get-XMProcess)
+    if ($procs.Count -eq 0) { return [IntPtr]::Zero }
+    $pids = @($procs | ForEach-Object { [int]$_.Id })
+    try { return [Win.XW]::PickGameWindow($pids) } catch { return [IntPtr]::Zero }
 }
 
 function Get-LogLinesFromName {
@@ -624,10 +846,7 @@ function Get-XMLogText {
     # Prefer the process main window (that is where the log box lives), then walk
     # the remaining top-level windows. Stop as soon as one yields the log box.
     $mainHwnd = [IntPtr]::Zero
-    try {
-        $pr = Get-Process -Name 'XM' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($pr -and $pr.MainWindowHandle -ne 0) { $mainHwnd = $pr.MainWindowHandle }
-    } catch {}
+    try { $mainHwnd = Get-XMMainWindow } catch {}
 
     if ($mainHwnd -ne [IntPtr]::Zero) {
         $t = Get-LogTextFromWindow -Hwnd $mainHwnd
@@ -743,36 +962,6 @@ function New-SeenSet {
     return $seen
 }
 
-function Show-Desktop {
-    # Minimise XM and bring the desktop forward.
-    #
-    # Called on DETECTING THE START LINE (not right after the click): the log
-    # box only becomes readable once the game has connected, and the reading is
-    # done through UI Automation, which keeps working while minimised.
-    Write-Log '--- returning to the desktop (minimising XM) ---'
-    if (-not ('Win.DT' -as [type])) {
-        Add-Type -Namespace 'Win' -Name 'DT' -MemberDefinition @'
-[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-[DllImport("user32.dll")] public static extern IntPtr FindWindowW(string cls, string win);
-[DllImport("user32.dll")] public static extern IntPtr GetShellWindow();
-'@
-    }
-    foreach ($h in (Get-XMWindows)) {
-        [void][Win.DT]::ShowWindow($h, 6)          # SW_MINIMIZE
-    }
-    try {
-        $prog = [Win.DT]::FindWindowW('Progman', $null)
-        if ($prog -ne [IntPtr]::Zero) {
-            [void][Win.DT]::ShowWindow($prog, 6)   # SW_MINIMIZE
-            Start-Sleep -Milliseconds 150
-            [void][Win.DT]::ShowWindow($prog, 9)   # SW_RESTORE
-        }
-    } catch {}
-    Start-Sleep -Milliseconds 400
-    Write-Log 'desktop shown; XM minimised (log is still readable)'
-}
-
 function Wait-DoneLine {
     # Wait for the completion line by checking ONLY the newest log line, every
     # $PollSeconds (default 5 minutes).
@@ -847,16 +1036,13 @@ function Wait-NewMarker {
             # that exist but expose no log box. Those are different problems.
             $wins = @(Get-XMWindows)
             $main = 0
-            try {
-                $pr = Get-Process -Name 'XM' -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($pr) { $main = $pr.MainWindowHandle }
-            } catch {}
+            try { $main = Get-XMMainWindow } catch {}
             $editCount = -1
             if ($main -ne 0) { $editCount = Get-EditControlCount -Hwnd ([IntPtr]$main) }
             Write-Log ('log not readable yet: XM processes=' +
-                       @(Get-Process -Name 'XM' -ErrorAction SilentlyContinue).Count +
+                       @(Get-XMProcess).Count +
                        ', top-level windows=' + $wins.Count +
-                       ', MainWindowHandle=0x' + ('{0:X}' -f [int64]$main) +
+                       ', game window=0x' + ('{0:X}' -f [int64]$main) +
                        ', Edit-controls in main window=' + $editCount) 'WARN'
             Write-Log ('  run probe_xm_windows.ps1 to dump every long text control') 'WARN'
             $warned = $true
@@ -891,6 +1077,7 @@ if ($WebhookConfigured) {
     Write-Log '          put your robot key in wecom_key.txt to enable WeCom push' 'WARN'
 }
 Write-Log ("xm path : " + $XmExe + "   (from " + $XmSource + ")")
+Write-Log ("xm proc : " + $XmProcName)
 Write-Log ("start marker : " + $M_START_DAILY)
 Write-Log ("done marker  : " + $P_DONE)
 Write-Log ("wait budgets: enter=${EnterTimeoutSeconds}s login=${LoginTimeoutSeconds}s start=${StartTimeoutSeconds}s settle=${SettleSeconds}s")
@@ -902,6 +1089,34 @@ if ($UseFixedCoords) {
 }
 
 # =============================================================================
+#  Administrator check - not optional.
+#
+#  XM.exe is manifested "requireAdministrator", so XM always runs elevated.
+#  Windows (UIPI) refuses to let a lower-privilege process inject mouse input
+#  into an elevated window: the clicks are dropped without any error, while UI
+#  Automation keeps reporting the controls perfectly. The result is a script
+#  that finds every button, computes the right coordinates, "clicks" - and
+#  nothing happens at all. Fail loudly instead of looking stuck.
+# =============================================================================
+$elevated = $false
+try {
+    $wid = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $wpr = New-Object System.Security.Principal.WindowsPrincipal($wid)
+    $elevated = $wpr.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { $elevated = $false }
+
+if (-not $elevated) {
+    Write-Log 'not running as administrator.' 'ERROR'
+    Write-Log 'XM.exe is manifested "requireAdministrator", so Windows silently drops' 'ERROR'
+    Write-Log 'mouse input sent by a lower-privilege process: every click would do' 'ERROR'
+    Write-Log 'nothing while the buttons still look perfectly clickable.' 'ERROR'
+    Write-Log 'Right-click seer.bat and pick "Run as administrator".' 'ERROR'
+    Write-Log ("exit " + 9)
+    Write-ExitSummary -Code 9
+    exit 9
+}
+
+# =============================================================================
 #  STEP 1 - launch XM, then click each control as soon as it is ready.
 #
 #  1) "enter offline mode" appears -> wait -SettleSeconds -> click
@@ -910,14 +1125,18 @@ if ($UseFixedCoords) {
 #  3) "start" becomes ENABLED      -> wait -SettleSeconds -> click
 #     (XM enables "start" only after login succeeds)
 #
-#  One click each. No retry loop, no blind long sleeps.
+#  Each click is then CONFIRMED before the next button is even looked for: the
+#  pressed button removes itself (login replaces "enter offline mode", "stop"
+#  replaces "start"), so it must be gone -ButtonCheckSeconds later; if it is
+#  still there the click missed and the same button is pressed again.
+#  No blind long sleeps.
 # =============================================================================
 $seenStart = $null
 
 if (-not $SkipLaunch) {
     Write-Log ('launching ' + $XmExe)
     if (-not (Test-Path -LiteralPath $XmExe)) {
-        Write-Log ('XM.exe not found: ' + $XmExe) 'ERROR'
+        Write-Log ('XM executable not found: ' + $XmExe) 'ERROR'
         Write-Log ("exit " + 9)
         Write-ExitSummary -Code 9
         exit 9
@@ -925,19 +1144,12 @@ if (-not $SkipLaunch) {
     Start-Process -FilePath $XmExe | Out-Null
 
     Write-Log '--- step 1/3: waiting for the "enter offline mode" button ---'
-    if (-not (Invoke-ButtonClick -Key enter -TimeoutSeconds $EnterTimeoutSeconds `
-                                 -FallbackX $EnterX -FallbackY $EnterY)) {
-        Write-Log '"enter offline mode" never became clickable' 'ERROR'
+    if (-not (Invoke-StepWithCheck -Key enter -TimeoutSeconds $EnterTimeoutSeconds `
+                                   -FallbackX $EnterX -FallbackY $EnterY)) {
+        Write-Log '"enter offline mode" never became clickable, or the click never took effect' 'ERROR'
         Write-Log ("exit " + 4)
         Write-ExitSummary -Code 4
         exit 4
-    }
-
-    # Give the next screen a moment to appear before looking for the login
-    # button; otherwise the wait starts while the old screen is still shown.
-    if ($SettleSeconds -gt 0) {
-        Write-Log ('  waiting ' + $SettleSeconds + 's for the next screen...')
-        Start-Sleep -Seconds $SettleSeconds
     }
 
     # If the update prompt was the one we clicked, tell the user.
@@ -949,9 +1161,9 @@ if (-not $SkipLaunch) {
     }
 
     Write-Log '--- step 2/3: waiting for the "login" button ---'
-    if (-not (Invoke-ButtonClick -Key login -TimeoutSeconds $LoginTimeoutSeconds `
-                                 -FallbackX $LoginX -FallbackY $LoginY)) {
-        Write-Log '"login" never became clickable' 'ERROR'
+    if (-not (Invoke-StepWithCheck -Key login -PrevKey 'enter' -TimeoutSeconds $LoginTimeoutSeconds `
+                                   -FallbackX $LoginX -FallbackY $LoginY)) {
+        Write-Log '"login" never became clickable, or the click never took effect' 'ERROR'
         Write-Log ("exit " + 5)
         Write-ExitSummary -Code 5
         exit 5
@@ -963,9 +1175,9 @@ if (-not $SkipLaunch) {
     $seenStart = New-SeenSet -Kind 'start'
 
     Write-Log '--- step 3/3: waiting for the "start" button to be ENABLED ---'
-    if (-not (Invoke-ButtonClick -Key start -TimeoutSeconds $StartTimeoutSeconds `
-                                 -FallbackX $StartX -FallbackY $StartY)) {
-        Write-Log '"start" never became enabled' 'ERROR'
+    if (-not (Invoke-StepWithCheck -Key start -PrevKey 'login' -TimeoutSeconds $StartTimeoutSeconds `
+                                   -FallbackX $StartX -FallbackY $StartY)) {
+        Write-Log '"start" never became enabled, or the click never took effect' 'ERROR'
         Write-Log ("exit " + 6)
         Write-ExitSummary -Code 6
         exit 6
@@ -996,13 +1208,6 @@ $startMsg = Get-StartNotifyText -Line $startLine
 Write-Log ('notifying: ' + $startMsg)
 if (Send-Wecom -Text $startMsg) { Write-Log 'start notification sent.' }
 else { Write-Log 'start notification FAILED.' 'ERROR' }
-
-# ---- on detecting the start line: hand the desktop back to the user ---------
-# This is the point where XM is fully up and the tasks are running, so it is
-# safe to minimise it. Detection continues to work while minimised.
-if ($ReturnToDesktop) {
-    Show-Desktop
-}
 
 # ---- wait for the completion line -------------------------------------------
 # Checks ONLY the newest log line, once every $DonePollSeconds (default 5min),

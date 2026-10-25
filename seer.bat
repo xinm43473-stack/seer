@@ -21,6 +21,30 @@ cd /d "%~dp0"
 
 set "BASE=%~dp0"
 
+:: ---------------------------------------------------------------------------
+::  Administrator check.
+::
+::  XM.exe carries a "requireAdministrator" manifest, so it ALWAYS runs
+::  elevated. Windows (UIPI) silently discards synthetic mouse input sent by a
+::  lower-privilege process, while UI Automation keeps reporting the controls -
+::  so every click looks like it "did nothing" and the whole flow stalls.
+::  Relaunch elevated when we are not elevated already.
+:: ---------------------------------------------------------------------------
+powershell -NoProfile -Command "if ((New-Object System.Security.Principal.WindowsPrincipal([System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 } else { exit 1 }"
+if errorlevel 1 (
+  echo.
+  echo This launcher must run as administrator, because XM.exe runs elevated.
+  echo Asking Windows for elevation...
+  powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -WorkingDirectory '%~dp0' -ArgumentList '%*' -Verb RunAs"
+  if errorlevel 1 (
+    echo.
+    echo [ERROR] automatic elevation failed.
+    echo Right-click seer.bat and choose "Run as administrator".
+    pause
+  )
+  exit /b
+)
+
 if not exist "%BASE%seer_run.ps1" (
   echo [ERROR] missing "%BASE%seer_run.ps1"
   pause

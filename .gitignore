@@ -1,3 +1,7 @@
+# --- 隐私配置（含机器人 key / 本机路径，绝对不要提交） ---
+wecom_key.txt
+xm_path.txt
+
 # --- 运行产物（不要把日志和压缩包提交进去） ---
 seer_watch.log
 *.log

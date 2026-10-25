@@ -10,6 +10,14 @@
 #  user32 mouse_event with 150 ms between down and up. Only the coordinates now
 #  come from the live control instead of hard-coded pixels.
 #
+#  Just before clicking, the point is verified to belong to XM. UIA still reports
+#  the controls of a window that is covered by another one, while a synthetic
+#  click always goes to whichever window is on top - so correct coordinates are
+#  not enough. When the point belongs to somebody else, XM is raised first (a
+#  background process needs AttachThreadInput to be allowed to do that). Without
+#  this, a run started from a background console clicked into the covering window
+#  and all three steps failed, even though every button was found.
+#
 #  Keys are passed as ASCII words, NOT Chinese text: PowerShell 5.1 encodes
 #  native argv with the ANSI code page, so Chinese arguments would be mangled.
 #  The Chinese labels are built here from Unicode code points instead.
@@ -23,13 +31,20 @@
 #  USAGE
 #    powershell -NoProfile -ExecutionPolicy Bypass -File click_ui.ps1 -Key start -Wait -TimeoutSeconds 300
 #    powershell -NoProfile -ExecutionPolicy Bypass -File click_ui.ps1 -Key enter -DryRun
+#    powershell -NoProfile -ExecutionPolicy Bypass -File click_ui.ps1 -Key enter -Probe
+#
+#  -Probe answers one question only: "is that control still on screen?"  It
+#  locates, prints and exits without settling and without clicking. seer_run.ps1
+#  uses it to check that a click actually took effect.
 #
 #  OUTPUT
 #    "found key=<matched key> name=..." then "clicked at (x,y)"
 #    The MATCHED KEY is printed because an alias may have matched (e.g. asking
 #    for 'enter' may match 'enter_update'), and the caller needs to know which.
 #
-#  EXIT 0 = clicked, 3 = nothing matched (caller decides what to do)
+#    With -Probe: "probe key=<key> found ..." or "probe key=<key> notfound".
+#
+#  EXIT 0 = clicked (or, with -Probe, found), 3 = nothing matched
 # =============================================================================
 
 [CmdletBinding()]
@@ -41,6 +56,10 @@ param(
     [int]$TimeoutSeconds = 180,
     [int]$SettleSeconds = 3,
     [switch]$DryRun,
+    # Locate only: report whether the control exists, then exit. Never clicks.
+    [switch]$Probe,
+    # Force a raise before clicking; the point check does this by itself whenever
+    # the click would land on another window.
     [switch]$BringToFront,
     # Testing hook: match against another process's window (default XM).
     [string]$ProcessName = 'XM'
@@ -100,6 +119,19 @@ if (-not ('Win.CU' -as [type])) {
 [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, uint e);
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
 [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[StructLayout(LayoutKind.Sequential)] public struct Pt { public int X; public int Y; }
+[DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Pt p);
+[DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint f);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
+[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+[DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder sb, int n);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder sb, int n);
 '@
 }
 [void][Win.CU]::SetProcessDPIAware()
@@ -107,9 +139,24 @@ if (-not ('Win.CU' -as [type])) {
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 Add-Type -AssemblyName System.Windows.Forms
 
+function Get-XMProcList {
+    # Compare the plain process name: Get-Process -Name does WILDCARD matching,
+    # which a renamed exe ("XM 3564.exe", "XM[1].exe") can break. Get-Process
+    # enumerates the same list either way, so this costs nothing extra.
+    return @(Get-Process -ErrorAction SilentlyContinue |
+             Where-Object { $_.ProcessName -eq $ProcessName })
+}
+
 function Get-XMProcess {
-    return (Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
-            Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1)
+    # Prefer a process that Windows thinks has a main window, but do NOT require
+    # it. MainWindowHandle is only a hint - input-method hooks hide the real
+    # window from it - and reporting "XM did not start" because of that would be
+    # plain wrong.
+    $list = @(Get-XMProcList)
+    if ($list.Count -eq 0) { return $null }
+    $withWin = @($list | Where-Object { $_.MainWindowHandle -ne 0 })
+    if ($withWin.Count -gt 0) { return $withWin[0] }
+    return $list[0]
 }
 
 function Find-Button {
@@ -141,6 +188,15 @@ function Find-Button {
             if (-not $raw) { continue }
             $nm = ([string]$raw).Replace($repl, '').Trim()
             if ($nm.Length -eq 0) { continue }
+
+            # Skip the log box. Its ClassName is 'Edit' and its text mentions
+            # words like "login" / "server login successful" / "start", so the
+            # "name contains the label" rule below reports a button that is no
+            # longer on screen - and seer_run.ps1 then believes the click failed
+            # and presses the same button again.
+            $cls = ''
+            try { $cls = [string]$e.Current.ClassName } catch { $cls = '' }
+            if ($cls -eq 'Edit') { continue }
 
             $r = $e.Current.BoundingRectangle
             if ($r.Width -le 1 -or $r.Height -le 1) { continue }
@@ -233,7 +289,7 @@ public static IntPtr[] ChildrenOf(IntPtr[] tops) {
 
 function Get-XMWindowsAll {
     # Top-level windows owned by XM plus all their children.
-    $procs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+    $procs = @(Get-XMProcList)
     if ($procs.Count -eq 0) { return @() }
     $pids = @($procs | ForEach-Object { [int]$_.Id })
     try {
@@ -247,11 +303,104 @@ function Get-XMWindowsAll {
     } catch { return @() }
 }
 
+function Get-XMGameWindow {
+    # Which window is the game itself?
+    #
+    # Process.MainWindowHandle CANNOT be trusted here. Input-method DLLs (iFlytek
+    # among them) load into the XM process and create their OWN top-level windows
+    # there. On this machine Windows reported MainWindowHandle as a window of
+    # class "iFLY_notify_window" - a 628x100 notification strip. Restoring and
+    # pinning THAT window is what drew a black band just above the taskbar, and
+    # it also meant "raise XM" never really raised the game.
+    #
+    # The game window is the visible top-level window of class "WTWindow". When
+    # several exist the longest title wins (the game window is "XM Seer...", the
+    # overlay window has a short title) and a non-minimised window wins over a
+    # minimised one. Returns [IntPtr]::Zero when there is none - never fall back
+    # to MainWindowHandle, that fallback is exactly the bug.
+    $best = [IntPtr]::Zero
+    $bestScore = -1
+    foreach ($h in @(Get-XMWindowsAll)) {
+        try {
+            if ([Win.CU]::GetAncestor($h, 2) -ne $h) { continue }        # top-level only
+            if (-not [Win.CU]::IsWindowVisible($h)) { continue }
+            $cn = New-Object System.Text.StringBuilder 256
+            [void][Win.CU]::GetClassNameW($h, $cn, 256)
+            if ($cn.ToString() -ne 'WTWindow') { continue }
+            $tb = New-Object System.Text.StringBuilder 512
+            [void][Win.CU]::GetWindowTextW($h, $tb, 512)
+            $score = $tb.ToString().Length * 1000
+            if (-not [Win.CU]::IsIconic($h)) { $score += 500 }
+            if ($score -gt $bestScore) { $bestScore = $score; $best = $h }
+        } catch { }
+    }
+    return $best
+}
+
 function Raised-XM {
+    # Bring the window to the front so that a synthetic click really lands on it.
+    # Two separate problems are handled here:
+    #
+    #   * a window that sits BEHIND another one still exposes its controls to
+    #     UIA, so the coordinates can be perfectly correct while the click goes
+    #     to whichever window is on top of it;
+    #   * a window started by a background process is not allowed to steal the
+    #     foreground, so a plain SetForegroundWindow is silently ignored.
+    #
+    # Attaching to the foreground thread's input queue works around the second
+    # one. The first one is handled by Set-XMTopmost, and only when this function
+    # turns out not to be enough.
     param([IntPtr]$Hwnd)
-    [void][Win.CU]::ShowWindow($Hwnd, 9)          # SW_RESTORE
+    if ([Win.CU]::IsIconic($Hwnd)) { [void][Win.CU]::ShowWindow($Hwnd, 9) }   # SW_RESTORE
+
+    $fg = [Win.CU]::GetForegroundWindow()
+    $fgPid = 0
+    $fgThread = 0
+    if ($fg -ne [IntPtr]::Zero) { $fgThread = [Win.CU]::GetWindowThreadProcessId($fg, [ref]$fgPid) }
+    $myThread = [Win.CU]::GetCurrentThreadId()
+
+    $attached = $false
+    if ($fgThread -ne 0 -and $fgThread -ne $myThread) {
+        $attached = [Win.CU]::AttachThreadInput($myThread, $fgThread, $true)
+    }
+    [void][Win.CU]::BringWindowToTop($Hwnd)
     [void][Win.CU]::SetForegroundWindow($Hwnd)
+    if ($attached) { [void][Win.CU]::AttachThreadInput($myThread, $fgThread, $false) }
+
     Start-Sleep -Milliseconds 400
+}
+
+function Set-XMTopmost {
+    # Pin the window above EVERY other window (HWND_TOPMOST), or release it.
+    #
+    # Windows refuses to hand the foreground to a background process, but it does
+    # allow the Z order to be changed - so this is the reliable way to make a
+    # synthetic click land on XM when another window covers it. It is switched on
+    # only for the duration of the click and always switched off afterwards.
+    param([IntPtr]$Hwnd, [bool]$On)
+    $swp = 0x0001 -bor 0x0002 -bor 0x0010          # NOSIZE | NOMOVE | NOACTIVATE
+    $after = -1                                     # HWND_TOPMOST
+    if (-not $On) { $after = -2 }                   # HWND_NOTOPMOST
+    [void][Win.CU]::SetWindowPos($Hwnd, [IntPtr]$after, 0, 0, 0, 0, $swp)
+}
+
+function Test-Clickable {
+    # Does the window that owns this screen point belong to the target process?
+    # WindowFromPoint returns the deepest child, so the root ancestor is checked.
+    param([int]$X, [int]$Y, [int[]]$Pids)
+    # WindowFromPoint takes a POINT BY VALUE. Declaring it as (int, int) makes it
+    # read the two numbers from two different registers and return nonsense.
+    $pt = New-Object 'Win.CU+Pt'
+    $pt.X = $X
+    $pt.Y = $Y
+    $at = [Win.CU]::WindowFromPoint($pt)
+    if ($at -eq [IntPtr]::Zero) { return $false }
+    $root = [Win.CU]::GetAncestor($at, 2)          # GA_ROOT
+    if ($root -eq [IntPtr]::Zero) { $root = $at }
+    $ownerPid = 0
+    [void][Win.CU]::GetWindowThreadProcessId($root, [ref]$ownerPid)
+    foreach ($p in $Pids) { if ([int]$p -eq [int]$ownerPid) { return $true } }
+    return $false
 }
 
 # ---- locate (optionally waiting for readiness) ------------------------------
@@ -276,7 +425,8 @@ while ($true) {
         # A hidden/behind window can drop its controls from the automation tree;
         # raise it once and look again.
         if (-not $raisedAlready) {
-            Raised-XM $proc.MainWindowHandle
+            $gw = Get-XMGameWindow
+            if ($gw -ne [IntPtr]::Zero) { Raised-XM $gw }
             $raisedAlready = $true
             $hit = Find-ButtonEverywhere
             if ($null -ne $hit) { break }
@@ -287,7 +437,7 @@ while ($true) {
 
     if ((Get-Date) -gt $deadline) {
         if (-not $sawProc) {
-            Write-Host ('XM.exe did not start within ' + $TimeoutSeconds + 's (' + $attempts + ' polls)')
+            Write-Host ($ProcessName + ' did not start within ' + $TimeoutSeconds + 's (' + $attempts + ' polls)')
         } else {
             Write-Host ('no matching control for key "' + $Key + '" after ' + $TimeoutSeconds +
                         's (' + $attempts + ' polls)')
@@ -298,8 +448,16 @@ while ($true) {
 }
 
 if ($null -eq $hit) {
-    Write-Host ('no matching control for key "' + $Key + '"')
+    if ($Probe) { Write-Host ('probe key=' + $Key + ' notfound') }
+    else { Write-Host ('no matching control for key "' + $Key + '"') }
     exit 3
+}
+
+if ($Probe) {
+    Write-Host ('probe key=' + $hit.Key + ' found name="' + $hit.Name + '" ' + $hit.W + 'x' + $hit.H +
+                ' center=(' + $hit.X + ',' + $hit.Y + ') enabled=' + $hit.Enabled +
+                ' rank=' + $hit.Rank + ' after ' + $attempts + ' poll(s)')
+    exit 0
 }
 
 Write-Host ('found key=' + $hit.Key + ' name="' + $hit.Name + '" ' + $hit.W + 'x' + $hit.H +
@@ -314,10 +472,57 @@ if ($SettleSeconds -gt 0) {
 
 if ($DryRun) { Write-Host 'DryRun: not clicking'; exit 0 }
 
+# ---- make sure the click can actually land on XM ---------------------------
+#
+# UIA reports the controls of covered windows too, so sending a click to the
+# right coordinates is not enough: whatever window is on TOP receives it. The
+# point is therefore checked first, XM is raised when it belongs to somebody
+# else, and the control is located again because raising can move the window.
+$procs = @(Get-XMProcList | Where-Object { $_.MainWindowHandle -ne 0 })
+$pids = @($procs | ForEach-Object { [int]$_.Id })
+$gameHwnd = Get-XMGameWindow
+
+if ($BringToFront -and $procs.Count -gt 0 -and $gameHwnd -ne [IntPtr]::Zero) {
+    Write-Host 'BringToFront: raising the window before clicking'
+    Raised-XM $gameHwnd
+    $again = Find-ButtonEverywhere
+    if ($null -ne $again) { $hit = $again }
+}
+
+$pinnedTopmost = $false
+for ($guard = 1; $guard -le 3; $guard++) {
+    if ($pids.Count -eq 0) { break }
+    if (Test-Clickable -X $hit.X -Y $hit.Y -Pids $pids) { break }
+    Write-Host ('point (' + $hit.X + ',' + $hit.Y + ') belongs to another window; raising ' +
+                $ProcessName + ' (' + $guard + '/3)')
+    if ($gameHwnd -ne [IntPtr]::Zero) { Raised-XM $gameHwnd }
+    $again = Find-ButtonEverywhere
+    if ($null -ne $again) { $hit = $again }
+}
+
+if ($pids.Count -gt 0 -and -not (Test-Clickable -X $hit.X -Y $hit.Y -Pids $pids)) {
+    Write-Host ('point (' + $hit.X + ',' + $hit.Y + ') is still covered; floating ' +
+                $ProcessName + ' above the other windows for the click')
+    if ($gameHwnd -ne [IntPtr]::Zero) { Set-XMTopmost -Hwnd $gameHwnd -On $true }
+    $pinnedTopmost = $true
+    Start-Sleep -Milliseconds 300
+    $again = Find-ButtonEverywhere
+    if ($null -ne $again) { $hit = $again }
+    if (-not (Test-Clickable -X $hit.X -Y $hit.Y -Pids $pids)) {
+        Write-Host ('WARNING: point (' + $hit.X + ',' + $hit.Y + ') still belongs to another window; clicking anyway')
+    }
+}
+
 [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($hit.X, $hit.Y)
 Start-Sleep -Milliseconds 150
 [Win.CU]::mouse_event(0x0002, 0, 0, 0, 0)
 Start-Sleep -Milliseconds 150
 [Win.CU]::mouse_event(0x0004, 0, 0, 0, 0)
 Write-Host ('clicked at (' + $hit.X + ',' + $hit.Y + ')')
+
+if ($pinnedTopmost) {
+    Start-Sleep -Milliseconds 200
+    if ($gameHwnd -ne [IntPtr]::Zero) { Set-XMTopmost -Hwnd $gameHwnd -On $false }
+    Write-Host 'topmost pin released'
+}
 exit 0
